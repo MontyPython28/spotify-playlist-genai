@@ -1,0 +1,29 @@
+# local env files
+.env
+
+# virtual environments
+venv/
+.venv/
+env/
+
+# raw data directories
+raw_data/
+data/raw/
+
+# local project data
+data/
+!data/mood_agent.db
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# local caches and local scripts
+.cache/
+.claude/
+.copilot/
+.cache
+*.bat
+
+# evaluation outputs
+eval_results/

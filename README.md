@@ -1,0 +1,175 @@
+# Spotify Mood Agent
+
+Turns your Spotify Extended Streaming History into a locally tagged, queryable
+music library, then lets you build playlists from freeform natural-language
+requests (e.g. *"sad songs but not too heavy"*, *"something chill for
+studying"*, *"songs like Blinding Lights but calmer"*) via a Claude-powered
+agent. Playlists can blend your own library with new tracks discovered
+through Last.fm, and be pushed straight to Spotify.
+
+Claude never writes SQL or picks songs directly — it only fills in the
+parameters of a fixed, tested `search_tracks()` query via tool-calling. The
+actual retrieval logic is deterministic code.
+
+## How it works
+
+1. **Ingest** — parse your Spotify Extended Streaming History export into a
+   clean, deduplicated per-track dataset with real listening stats (play
+   count, skip rate, days since last played, peak listening hour, etc.).
+2. **Ground** — fetch community tags and duration from Last.fm for every
+   track, to use as grounding context.
+3. **Tag** — send each track to Claude (in checkpointed batches) to generate
+   mood, energy, pace, situational, sound, and lyrical-theme tags, grounded
+   in the real Last.fm data rather than invented from scratch.
+4. **Load** — store the tagged library in a local SQLite database with
+   indexes for fast filtering.
+5. **Query** — the agent translates a freeform request into structured
+   search parameters (tags, energy/valence/pace ranges, genre, exclusions,
+   listening-history filters, "similar to X" seeding, new-music discovery
+   ratio), runs the search, optionally blends in newly discovered tracks via
+   Last.fm, and assembles a playlist.
+6. **Push** — optionally send the resulting playlist to Spotify as a new
+   public or private playlist.
+
+## Project layout
+
+```
+src/
+  process/            Offline pipeline (run once, or re-run to refresh data)
+    phase1_load_data.py       Parse raw Spotify export -> clean parquet
+    phase2_aggregate.py       Aggregate play events -> per-track stats
+    phase3_fetch_lastfm.py  Fetch Last.fm tags/duration per track
+    phase4_tag_moods.py       Claude-generated mood/energy/tag data (batched)
+    phase5_load_sqlite.py     Load tagged tracks into SQLite
+
+  spotify/
+    spotify_auth.py    OAuth (PKCE) against the Spotify Web API
+    spotify_push.py    Push an assembled playlist to Spotify
+
+  agent/               The interactive query agent
+    agent.py            CLI entry point / tool-calling loop with Claude
+    search_engine.py    SearchParams + deterministic SQL query builder
+    discovery.py        Last.fm-based new-music discovery
+    playlist.py         Blends library + discovery results into a playlist
+
+  test/
+    eval_agent.py        Automated eval harness for the agent's query translation
+    test_*.py            Focused unit tests for individual phases and components
+
+raw_data/     Your raw Spotify export JSON (gitignored)
+data/         Processed parquet files + the SQLite DB (gitignored, DB excepted)
+eval_results/ Output of eval_agent.py runs (gitignored)
+```
+
+## Setup
+
+### 1. Install dependencies
+
+For Windows:
+
+```
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Configure credentials
+
+Create a `.env` file in the project root:
+
+```
+SPOTIFY_CLIENT_ID=
+SPOTIFY_CLIENT_SECRET=
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
+ANTHROPIC_API_KEY=
+LASTFM_API_KEY=
+```
+
+- Spotify credentials: create an app at the [Spotify Developer
+  Dashboard](https://developer.spotify.com/dashboard) and add
+  `http://127.0.0.1:8888/callback` as a redirect URI.
+- `ANTHROPIC_API_KEY`: from the [Anthropic Console](https://console.anthropic.com).
+- `LASTFM_API_KEY`: from [Last.fm's API page](https://www.last.fm/api/account/create).
+
+## API keys and costs
+
+| Service | Used for | Where to get it | Cost |
+|---|---|---|---|
+| **Spotify** | OAuth login, reading your library metadata, pushing playlists | Create an app at the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) — gives you a Client ID and Client Secret. Add `http://127.0.0.1:8888/callback` as a Redirect URI in the app settings. | Free. |
+| **Anthropic** | Phase 4 mood tagging + the query agent's tool-calling | Create a key at the [Anthropic Console](https://console.anthropic.com/settings/keys). Requires billing set up (pay-as-you-go). | **Not free — the main real cost in this project.** Everything uses `claude-haiku-4-5`. Phase 4 (one-time tagging of your whole library) runs via the Batches API at ~$1 per ~1,200 tracks (batch pricing is 50% off standard rates), so a library of a few thousand tracks costs a few dollars total, and re-running it (e.g. after a prompt tweak) re-charges for whatever tracks you re-tag. Each agent query costs a fraction of a cent (prompt caching keeps the ~3,000-token tool schema/system prompt cheap on repeat queries within a 5-minute window); the agent prints per-query cost and a running total, also logged to `data/agent_cost_log.json`. |
+| **Last.fm** | Grounding tags for Phase 4 + new-music discovery | Register an app at [Last.fm's API account page](https://www.last.fm/api/account/create) to get an API key. | Free (rate-limited to ~5 requests/sec, which the pipeline already paces itself to). |
+
+### 3. Add your Spotify data export
+
+Request your **Extended Streaming History** from Spotify (Account →
+Privacy Settings), and drop the `Streaming_History_Audio_*.json` files into
+`raw_data/`.
+
+## Building the library
+
+Run each phase from the project root, in order:
+
+```
+python src/process/phase1_load_data.py
+python src/process/phase2_aggregate.py
+python src/process/phase3_fetch_lastfm.py
+python src/process/phase4_tag_moods.py run
+python src/process/phase5_load_sqlite.py
+```
+
+- Phase 3 and Phase 4 are checkpointed and safe to interrupt (Ctrl+C) and
+  resume — they pick up exactly where they left off.
+- Phase 4 costs real Anthropic API credits (~$1 per ~1,200 tracks) and
+  submits work in sequential batches so only one chunk's cost is ever at
+  risk at a time.
+
+This produces `data/mood_agent.db`, the SQLite database the agent queries.
+
+## Using the agent
+
+```
+python src/agent/agent.py                          # interactive mode
+python src/agent/agent.py "songs for a victory parade"   # single-shot
+```
+
+In interactive mode:
+
+| Command | Effect |
+|---|---|
+| `<any request>` | Build a playlist from a freeform request |
+| `push` | Push the current playlist to Spotify (prompts for name/visibility) |
+| `new` | Clear context — next request starts fresh |
+| `help` / `?` | Show command help |
+| `quit` / `exit` / `q` | Exit |
+
+Requests can be refined conversationally without repeating the whole
+original request, e.g. after an initial request: `make it more upbeat`,
+`swap out the sad ones`, `no Taylor Swift this time`.
+
+New-music discovery (via Last.fm) is on by default at a light 30% mix for
+ordinary requests, and scales up with phrasing like "some new" (60%), "new"
+(90%), or "all new" (100%); say "from my library" / "old" to disable it.
+
+Each query's token usage and cost are printed after every request, along
+with a running session total logged to `data/agent_cost_log.json`.
+
+## Evaluation
+
+```
+python src/test/eval_agent.py                # run all eval cases
+python src/test/eval_agent.py --case 5        # run a single case
+python src/test/eval_agent.py --verbose       # print full playlists
+```
+
+Runs a fixed set of test prompts through the current agent, checks
+automatable assertions, and writes a timestamped report to `eval_results/`.
+Use this before/after prompt or logic changes to confirm you're actually
+improving quality rather than shifting where failures land.
+
+## Notes
+
+- `data/`, `raw_data/`, and `eval_results/` are gitignored — this repo does
+  not include your personal listening history or generated database.
+- The Spotify auth flow uses Authorization Code + PKCE (no client secret in
+  the token exchange); the refresh token is cached locally in
+  `data/spotify_token.json` after the first browser login.

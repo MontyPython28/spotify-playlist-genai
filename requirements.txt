@@ -1,0 +1,6 @@
+pandas==2.2.3
+pyarrow==25.0.0
+spotipy==2.24.0
+python-dotenv==1.0.1
+anthropic==0.121.0
+requests==2.32.3
