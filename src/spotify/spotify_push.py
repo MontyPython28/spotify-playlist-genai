@@ -10,6 +10,7 @@ silently dropped.
 """
 
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 API_BASE = "https://api.spotify.com/v1"
 
@@ -70,6 +71,52 @@ def search_track(access_token: str, track_name: str, artist_name: str) -> str | 
     return items[0]["uri"]
 
 
+def resolve_track(access_token: str, track_name: str, artist_name: str) -> dict | None:
+    """Like search_track, but returns the fuller match info the UI needs --
+    URI plus album artwork and the canonical name/artist Spotify has on
+    file. Returns None if no confident match (i.e. the track isn't on
+    Spotify), which is exactly the signal used to filter it out of results
+    before the user ever sees it.
+
+    Returns:
+        {
+          "uri": str,
+          "image_url": str | None,   # smallest-but-decent album thumbnail
+          "album": str,
+          "spotify_name": str,       # Spotify's canonical track name
+          "spotify_artist": str,     # Spotify's canonical primary artist
+        }
+    """
+    query = f"track:{track_name} artist:{artist_name}"
+    resp = requests.get(
+        f"{API_BASE}/search",
+        headers=_auth_headers(access_token),
+        params={"q": query, "type": "track", "limit": 1},
+    )
+    _raise_with_detail(resp)
+    items = resp.json().get("tracks", {}).get("items", [])
+    if not items:
+        return None
+
+    item = items[0]
+    album = item.get("album", {})
+    images = album.get("images", [])
+    # Spotify returns images largest-first (typically 640/300/64). Prefer a
+    # mid/small one for a list thumbnail rather than the full-size cover.
+    image_url = images[-1]["url"] if images else None
+    if len(images) >= 2:
+        image_url = images[1]["url"]  # the ~300px middle size when available
+
+    artists = item.get("artists", [])
+    return {
+        "uri": item["uri"],
+        "image_url": image_url,
+        "album": album.get("name", ""),
+        "spotify_name": item.get("name", track_name),
+        "spotify_artist": artists[0]["name"] if artists else artist_name,
+    }
+
+
 def add_tracks_to_playlist(access_token: str, playlist_id: str, uris: list[str]) -> None:
     """Add tracks to a playlist, chunked at 100 URIs per call (API limit)."""
     for i in range(0, len(uris), 100):
@@ -80,6 +127,42 @@ def add_tracks_to_playlist(access_token: str, playlist_id: str, uris: list[str])
             json={"uris": chunk},
         )
         _raise_with_detail(resp)
+
+
+def resolve_playlist(access_token: str, playlist: list[dict], max_workers: int = 10) -> dict:
+    """Resolve EVERY track in a playlist against Spotify concurrently, so the
+    UI can show album art and a confirmed URI for each -- and so tracks that
+    aren't on Spotify are dropped before the user ever sees them.
+
+    Runs the ~N searches in a thread pool (same lesson as discovery.py:
+    sequential per-track network calls are painfully slow). Returns:
+        {
+          "resolved": [ {track dict + uri + image_url + album}, ... ],
+          "dropped":  [ {original track dict}, ... ]   # not found on Spotify
+        }
+    Input tracks are dicts with at least track_name, artist_name, source.
+    """
+    def _resolve_one(track):
+        try:
+            info = resolve_track(access_token, track["track_name"], track["artist_name"])
+        except Exception:
+            info = None
+        return track, info
+
+    resolved = []
+    dropped = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for track, info in executor.map(_resolve_one, playlist):
+            if info is None:
+                dropped.append(track)
+            else:
+                enriched = dict(track)
+                enriched["track_uri"] = info["uri"]
+                enriched["image_url"] = info["image_url"]
+                enriched["album"] = info["album"]
+                resolved.append(enriched)
+
+    return {"resolved": resolved, "dropped": dropped}
 
 
 def push_playlist(

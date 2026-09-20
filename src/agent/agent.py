@@ -520,27 +520,29 @@ def call_agent(client: Anthropic, user_prompt: str, search_tool: dict):
     return params, json.dumps(tool_input, indent=2), similar_to_note, usage, discover_new, resolved_seed, discovery_ratio
 
 
-def run_query(client: Anthropic, search_tool: dict, user_prompt: str, context: str = "") -> tuple[dict, list]:
-    """Run one query -- used for both single-shot mode and each turn of an
-    interactive session. Returns (tool_input_dict, playlist) so a calling
-    loop can carry state into the next turn."""
+def generate_playlist(client: Anthropic, search_tool: dict, user_prompt: str, context: str = "") -> dict:
+    """Core query logic, PURE (no printing) -- returns a structured dict so
+    both the CLI (run_query) and the local API can share one source of
+    truth for the discovery/assembly pipeline. Returns:
+        {
+          "tool_input": dict,          # the parameters Claude chose
+          "playlist": list[dict],      # assembled, blended playlist
+          "similar_note": str | None,  # seed-resolution note, if any
+          "usage": dict,               # token/cost info for this query
+          "discovery_ratio": float,    # effective ratio actually applied
+        }
+    """
     full_prompt = f"{context}\n\nNew instruction: {user_prompt}" if context else user_prompt
 
-    print(f'Request: "{user_prompt}"\n')
     params, debug_params, similar_note, usage, discover_new, resolved_seed, discovery_ratio = call_agent(
         client, full_prompt, search_tool
     )
-    if similar_note:
-        print(similar_note + "\n")
-    print("Parameters Claude chose:")
-    print(debug_params)
 
     results = search_tracks(params)
     discovery_results = []
     tool_input_dict = json.loads(debug_params)
 
     if discover_new:
-        print(f"\nSearching your library + discovering new music (ratio: {discovery_ratio:.0%} new)...")
         seeds = [(r["track_name"], r["artist_name"]) for r in results[:5]]
         if resolved_seed:
             seed_tuple = (resolved_seed["track_name"], resolved_seed["artist_name"])
@@ -549,12 +551,8 @@ def run_query(client: Anthropic, search_tool: dict, user_prompt: str, context: s
 
         if seeds:
             # Fetch enough discovery candidates to actually satisfy the
-            # target ratio -- previously hardcoded to 20 regardless of how
-            # many were needed, which silently capped high-ratio requests
-            # (e.g. 0.9 or 1.0) well below their target: a 25-track
-            # playlist at ratio=0.9 needs ~22 discovery tracks, but a flat
-            # limit of 20 can never supply that many. +10 buffer accounts
-            # for candidates lost to library/artist-exclusion filtering.
+            # target ratio (see run_query's original comment) -- +10 buffer
+            # accounts for candidates lost to library/artist-exclusion filtering.
             needed = int(params.limit * discovery_ratio)
             fetch_limit = max(20, needed + 10)
             try:
@@ -562,8 +560,10 @@ def run_query(client: Anthropic, search_tool: dict, user_prompt: str, context: s
                     seeds, limit=fetch_limit, exclude_artists=params.exclude_artists,
                     exclude_tracks=tool_input_dict.get("exclude_tracks", []),
                 )
-            except EnvironmentError as e:
-                print(f"Discovery unavailable: {e}")
+            except EnvironmentError:
+                # Last.fm key missing -- degrade gracefully to library-only
+                # rather than failing the whole query.
+                discovery_results = []
     else:
         discovery_ratio = 0.0
 
@@ -573,6 +573,30 @@ def run_query(client: Anthropic, search_tool: dict, user_prompt: str, context: s
         total_size=params.limit,
         discovery_ratio=discovery_ratio,
     )
+
+    return {
+        "tool_input": tool_input_dict,
+        "playlist": playlist,
+        "similar_note": similar_note,
+        "usage": usage,
+        "discovery_ratio": discovery_ratio,
+    }
+
+
+def run_query(client: Anthropic, search_tool: dict, user_prompt: str, context: str = "") -> tuple[dict, list]:
+    """CLI wrapper around generate_playlist -- keeps all the terminal
+    printing here so the core logic stays pure and API-reusable. Returns
+    (tool_input_dict, playlist) so the interactive loop can carry state."""
+    print(f'Request: "{user_prompt}"\n')
+    result = generate_playlist(client, search_tool, user_prompt, context)
+
+    if result["similar_note"]:
+        print(result["similar_note"] + "\n")
+    print("Parameters Claude chose:")
+    print(json.dumps(result["tool_input"], indent=2))
+
+    playlist = result["playlist"]
+    usage = result["usage"]
 
     lib_count = sum(1 for t in playlist if t["source"] == "library")
     new_count = sum(1 for t in playlist if t["source"] == "new")
@@ -590,7 +614,7 @@ def run_query(client: Anthropic, search_tool: dict, user_prompt: str, context: s
     total_cost, total_queries = log_cost(usage['cost_usd'])
     print(f"Session total so far: ${total_cost:.4f} across {total_queries} quer{'y' if total_queries == 1 else 'ies'}")
 
-    return json.loads(debug_params), playlist
+    return result["tool_input"], playlist
 
 
 def summarize_playlist(playlist: list[dict], max_tracks: int = 10) -> str:

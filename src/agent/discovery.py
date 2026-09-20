@@ -11,10 +11,11 @@ deduplicated, and filtered against the user's existing library so results
 are genuinely new.
 
 This is a real-time, interactive-query module (a handful of calls per
-request), unlike phase3_fetch_lastfm.py's bulk checkpointed job.
+request), unlike phase3_5_fetch_lastfm.py's bulk checkpointed job.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from dotenv import load_dotenv
@@ -83,10 +84,16 @@ def get_artist_top_tracks(api_key: str, artist: str, limit: int = 5) -> list[dic
     return results
 
 
-def _in_library(track_name: str, artist_name: str, db_path=DB_FILE) -> bool:
-    """Check whether a track already exists in the user's local library."""
-    candidates = find_track(track_name, artist_name, db_path=db_path)
-    return len(candidates) > 0
+def _load_library_keys(db_path=DB_FILE) -> set[tuple[str, str]]:
+    """Load ALL (track_name, artist_name) pairs from the library once, as a
+    set for O(1) membership tests. Previously we called find_track() per
+    candidate -- ~40 separate DB connections+queries per discovery query.
+    One batched read is dramatically faster and the set lookup is instant."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT track_name, artist_name FROM tracks").fetchall()
+    conn.close()
+    return {(n.strip().lower(), a.strip().lower()) for n, a in rows}
 
 
 def discover_new_music(
@@ -114,45 +121,59 @@ def discover_new_music(
 
     candidates: dict[tuple[str, str], dict] = {}
 
-    seen_artists = set()
-    for seed_track, seed_artist in seeds:
-        # Surface 1: tracks similar to this specific track
-        similar_tracks = get_similar_tracks(api_key, seed_artist, seed_track)
-        for s in similar_tracks:
-            key = (s["name"].strip().lower(), s["artist"].strip().lower())
+    def _merge(track_list):
+        """Fold a list of candidate tracks into the shared candidates dict."""
+        for t in track_list:
+            key = (t["name"].strip().lower(), t["artist"].strip().lower())
             if key not in candidates:
                 candidates[key] = {
-                    "name": s["name"], "artist": s["artist"],
-                    "best_match": s["match"], "seed_count": 1,
-                    "source": s["source"],
+                    "name": t["name"], "artist": t["artist"],
+                    "best_match": t["match"], "seed_count": 1,
+                    "source": t["source"],
                 }
             else:
-                candidates[key]["best_match"] = max(candidates[key]["best_match"], s["match"])
+                candidates[key]["best_match"] = max(candidates[key]["best_match"], t["match"])
                 candidates[key]["seed_count"] += 1
 
-        # Surface 2: similar artists' top tracks (skip if we already
-        # explored this artist from a prior seed to avoid redundant calls)
-        artist_key = seed_artist.strip().lower()
-        if artist_key not in seen_artists:
-            seen_artists.add(artist_key)
-            similar_artists = get_similar_artists(api_key, seed_artist)
-            for sim_artist in similar_artists:
-                top_tracks = get_artist_top_tracks(api_key, sim_artist)
-                for t in top_tracks:
-                    key = (t["name"].strip().lower(), t["artist"].strip().lower())
-                    if key not in candidates:
-                        candidates[key] = {
-                            "name": t["name"], "artist": t["artist"],
-                            "best_match": t["match"], "seed_count": 1,
-                            "source": t["source"],
-                        }
-                    else:
-                        candidates[key]["seed_count"] += 1
+    # All Last.fm calls are independent, so run them concurrently instead of
+    # one-at-a-time. Sequentially this was ~40+ round-trips (10-20s of pure
+    # network waiting); a thread pool collapses that into a few parallel
+    # batches. Two phases because phase 2 (artist top tracks) depends on the
+    # similar-artist lists produced in phase 1.
+    unique_seed_artists = list({a.strip().lower(): (t, a) for t, a in seeds}.values())
 
-    # Filter out anything already in the user's library.
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Phase 1: per-seed similar tracks + per-unique-artist similar artists
+        similar_tracks_futures = [
+            executor.submit(get_similar_tracks, api_key, a, t) for t, a in seeds
+        ]
+        similar_artists_futures = {
+            a: executor.submit(get_similar_artists, api_key, a)
+            for _, a in unique_seed_artists
+        }
+
+        for fut in similar_tracks_futures:
+            _merge(fut.result())
+
+        similar_artist_names = []
+        for fut in similar_artists_futures.values():
+            similar_artist_names.extend(fut.result())
+        # Dedupe similar artists so we don't fetch the same one's top tracks twice
+        similar_artist_names = list(dict.fromkeys(similar_artist_names))
+
+        # Phase 2: top tracks for every (deduped) similar artist, concurrently
+        top_track_futures = [
+            executor.submit(get_artist_top_tracks, api_key, a) for a in similar_artist_names
+        ]
+        for fut in top_track_futures:
+            _merge(fut.result())
+
+    # Filter out anything already in the user's library (single batched
+    # read + in-memory set membership, instead of a DB query per candidate).
+    library_keys = _load_library_keys(db_path)
     new_candidates = [
         c for c in candidates.values()
-        if not _in_library(c["name"], c["artist"], db_path)
+        if (c["name"].strip().lower(), c["artist"].strip().lower()) not in library_keys
     ]
 
     # Filter out excluded artists (case-insensitive substring match, same

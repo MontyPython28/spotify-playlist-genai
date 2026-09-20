@@ -18,6 +18,9 @@ data/
 __pycache__/
 *.py[cod]
 
+# Packages
+frontend/node_modules/
+
 # local caches and local scripts
 .cache/
 .claude/
