@@ -28,8 +28,9 @@ import sqlite3
 from collections import Counter
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+
+from llm_provider import call_tool, ToolSpec
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "spotify"))
 
@@ -87,11 +88,11 @@ def get_tag_vocabulary(db_path=DB_FILE, top_n: int = VOCAB_SAMPLE_SIZE) -> list[
     return [tag for tag, _ in counter.most_common(top_n)]
 
 
-def build_search_tool(vocabulary: list[str]) -> dict:
+def build_search_tool(vocabulary: list[str]) -> ToolSpec:
     vocab_str = ", ".join(sorted(vocabulary))
-    return {
-        "name": "search_tracks",
-        "description": f"""Search the user's tagged music library.
+    return ToolSpec(
+        name="search_tracks",
+        description=f"""Search the user's tagged music library.
 
 The track database uses this schema:
 - genres: primary genre of each track
@@ -118,7 +119,7 @@ exact string matching is used, so a tag that doesn't resemble anything in
 the real vocabulary will silently match nothing.
 
 Real tag vocabulary sample: {vocab_str}""",
-        "input_schema": {
+        parameters={
             "type": "object",
             "properties": {
                 "tags": {
@@ -178,7 +179,7 @@ Real tag vocabulary sample: {vocab_str}""",
                 "limit": {"type": "integer"},
             },
         },
-    }
+    )
 
 
 SYSTEM_PROMPT = """You are a music search-query translator. Translate the user's \
@@ -360,8 +361,13 @@ Examples:
 - "recommend something new like cardigan" -> mentions "new" plainly -> discovery_ratio=0.9
 - "give me some new songs for a workout" -> "some new" -> discovery_ratio=0.6
 - "a playlist that's entirely new" -> "entirely new" -> discovery_ratio=1.0
-- "road trip playlist, all from my library" -> discover_new=false
-- "high energy playlist" (no mention of new/old at all) -> discover_new=false (ordinary request, no discovery signal)
+- "road trip playlist, all from my library" -> set discover_new=false EXPLICITLY
+- "high energy playlist" (no mention of new/old at all) -> discover_new=true (ordinary request, discovery is on by default at 0.3)
+
+CRITICAL: for any library-only request ("from my library", "old", "nothing new", "just my \
+music"), you MUST set discover_new to the literal value false. Do NOT omit the field -- \
+omitting it is treated as the on-by-default case and will wrongly include new music. \
+Explicit false is the only thing that turns discovery off.
 
 ## OUTPUT
 
@@ -370,54 +376,15 @@ imply. After results come back, give a short 2-3 sentence explanation of your \
 interpretation. Do not list every track individually -- results are shown separately."""
 
 
-def call_agent(client: Anthropic, user_prompt: str, search_tool: dict):
+def call_agent(user_prompt: str, search_tool: dict):
     """Returns (params, debug_json, similar_to_note, usage, discover_new, resolved_seed).
     usage is {'input_tokens', 'cache_write_tokens', 'cache_read_tokens', 'output_tokens', 'cost_usd'}.
     resolved_seed is the full seed track dict (with real artist_name) if a
     similar_to_track request was resolved, else None."""
-    # Prompt caching: the tool definition (which embeds ~150 vocabulary tags)
-    # and the system prompt are both large and mostly static across calls --
-    # marking them cacheable means repeat queries within the 5-minute cache
-    # window only pay full price for the small, genuinely new part of each
-    # request (the user's actual message), not the ~3000+ tokens of fixed
-    # schema/vocabulary resent every time. Order matters: tools, then system,
-    # then messages, per Anthropic's caching rules.
-    cached_tool = {**search_tool, "cache_control": {"type": "ephemeral"}}
-    system_blocks = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=600,
-        system=system_blocks,
-        tools=[cached_tool],
-        tool_choice={"type": "tool", "name": "search_tracks"},
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    tool_use = next(b for b in response.content if b.type == "tool_use")
-    tool_input = tool_use.input
-
-    # Cost tracking, accounting for prompt-cache pricing tiers (Haiku 4.5
-    # standard API): $1.00/MTok fresh input, $1.25/MTok cache write (25%
-    # premium), $0.10/MTok cache read (90% off), $5.00/MTok output.
-    input_tokens = response.usage.input_tokens
-    cache_write_tokens = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-    cache_read_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
-    output_tokens = response.usage.output_tokens
-
-    cost_usd = (
-        input_tokens / 1_000_000 * 1.00
-        + cache_write_tokens / 1_000_000 * 1.25
-        + cache_read_tokens / 1_000_000 * 0.10
-        + output_tokens / 1_000_000 * 5.00
-    )
-    usage = {
-        "input_tokens": input_tokens,
-        "cache_write_tokens": cache_write_tokens,
-        "cache_read_tokens": cache_read_tokens,
-        "output_tokens": output_tokens,
-        "cost_usd": cost_usd,
-    }
+    # The actual LLM call goes through the pluggable provider layer
+    # (llm_provider.call_tool), which routes to Anthropic or Gemini based on
+    # the LLM_PROVIDER env var. Everything below is provider-agnostic.
+    tool_input, usage = call_tool(SYSTEM_PROMPT, search_tool, user_prompt)
 
     similar_to_note = None
     seed_params = {}
@@ -520,7 +487,7 @@ def call_agent(client: Anthropic, user_prompt: str, search_tool: dict):
     return params, json.dumps(tool_input, indent=2), similar_to_note, usage, discover_new, resolved_seed, discovery_ratio
 
 
-def generate_playlist(client: Anthropic, search_tool: dict, user_prompt: str, context: str = "") -> dict:
+def generate_playlist(search_tool: dict, user_prompt: str, context: str = "") -> dict:
     """Core query logic, PURE (no printing) -- returns a structured dict so
     both the CLI (run_query) and the local API can share one source of
     truth for the discovery/assembly pipeline. Returns:
@@ -535,7 +502,7 @@ def generate_playlist(client: Anthropic, search_tool: dict, user_prompt: str, co
     full_prompt = f"{context}\n\nNew instruction: {user_prompt}" if context else user_prompt
 
     params, debug_params, similar_note, usage, discover_new, resolved_seed, discovery_ratio = call_agent(
-        client, full_prompt, search_tool
+        full_prompt, search_tool
     )
 
     results = search_tracks(params)
@@ -583,12 +550,12 @@ def generate_playlist(client: Anthropic, search_tool: dict, user_prompt: str, co
     }
 
 
-def run_query(client: Anthropic, search_tool: dict, user_prompt: str, context: str = "") -> tuple[dict, list]:
+def run_query(search_tool: dict, user_prompt: str, context: str = "") -> tuple[dict, list]:
     """CLI wrapper around generate_playlist -- keeps all the terminal
     printing here so the core logic stays pure and API-reusable. Returns
     (tool_input_dict, playlist) so the interactive loop can carry state."""
     print(f'Request: "{user_prompt}"\n')
-    result = generate_playlist(client, search_tool, user_prompt, context)
+    result = generate_playlist(search_tool, user_prompt, context)
 
     if result["similar_note"]:
         print(result["similar_note"] + "\n")
@@ -681,7 +648,7 @@ def push_to_spotify(playlist: list[dict]) -> None:
     print()
 
 
-def interactive_loop(client: Anthropic, search_tool: dict) -> None:
+def interactive_loop(search_tool: dict) -> None:
     print("Interactive mode. Type a request, 'new' to clear context, 'help', or 'quit'.\n")
     last_tool_input = None
     last_playlist = None
@@ -722,7 +689,7 @@ def interactive_loop(client: Anthropic, search_tool: dict) -> None:
             )
 
         try:
-            last_tool_input, last_playlist = run_query(client, search_tool, user_input, context)
+            last_tool_input, last_playlist = run_query(search_tool, user_input, context)
         except Exception as e:
             print(f"Error: {e}\n")
         print()
@@ -730,11 +697,6 @@ def interactive_loop(client: Anthropic, search_tool: dict) -> None:
 
 def main():
     load_dotenv()
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise EnvironmentError("ANTHROPIC_API_KEY not found in .env")
-
-    client = Anthropic(api_key=api_key)
 
     print("Loading real tag vocabulary from your library...")
     vocabulary = get_tag_vocabulary()
@@ -745,10 +707,10 @@ def main():
     if len(sys.argv) >= 2:
         # Single-shot mode: python agent.py "prompt" -- unchanged behavior
         user_prompt = " ".join(sys.argv[1:])
-        run_query(client, search_tool, user_prompt)
+        run_query(search_tool, user_prompt)
     else:
         # No argument: interactive mode
-        interactive_loop(client, search_tool)
+        interactive_loop(search_tool)
 
 
 if __name__ == "__main__":

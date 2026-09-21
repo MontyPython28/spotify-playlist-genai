@@ -18,7 +18,9 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -29,7 +31,6 @@ from typing import Callable
 # src/agent/ folder, so add that to the import path explicitly.
 sys.path.insert(0, str(Path(__file__).parent.parent / "agent"))
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 
 from agent import (
@@ -185,22 +186,22 @@ TEST_CASES = [
         ("~90% new tracks", check_discovery_fraction(0.85, 1.0)),
     ]),
 
-    TestCase(3, "routing", "road trip playlist, all from my library", [
+    TestCase(4, "routing", "road trip playlist, all from my library", [
         ("discover_new=false", check_param_in("discover_new", [None, False])),
         ("0% discovery in output", check_discovery_fraction(0.0, 0.0)),
     ]),
 
-    TestCase(4, "routing", "songs like Blinding Lights but calmer", [
+    TestCase(5, "routing", "songs like Blinding Lights but calmer", [
         ("similar_to_track set", check_param_set("similar_to_track")),
         ("energy_max set (override)", check_param_set("energy_max")),
         ("energy_max is medium or lower", check_energy_at_most("medium")),
     ]),
 
-    TestCase(5, "exclusion", "high energy rock playlist but not I Wanna Be Your Slave by Maneskin", [
+    TestCase(6, "exclusion", "high energy rock playlist but not I Wanna Be Your Slave by Maneskin", [
         ("track not in playlist", check_no_track_in_playlist("I Wanna Be Your Slave")),
     ]),
 
-    TestCase(6, "exclusion", "high energy playlist but not aggressive", [
+    TestCase(7, "exclusion", "high energy playlist but not aggressive", [
         ("energy_min set to at least medium-high", check_energy_at_least("medium-high")),
         ("exclude_tags includes aggression synonyms",
          check_exclude_tags_include_any(["aggressive", "harsh", "intense"])),
@@ -208,7 +209,7 @@ TEST_CASES = [
          check_exclude_tags_include_any(["distorted", "screaming", "heavy drums", "punchy"])),
     ]),
 
-    TestCase(7, "exclusion", "sad songs but nothing by Lana Del Rey", [
+    TestCase(8, "exclusion", "sad songs but nothing by Lana Del Rey", [
         ("exclude_artists includes Lana Del Rey",
          lambda ti, p: (
              any("lana" in a.lower() for a in ti.get("exclude_artists", [])),
@@ -217,7 +218,7 @@ TEST_CASES = [
         ("no Lana Del Rey in playlist", check_no_artist_in_playlist("Lana Del Rey")),
     ]),
 
-    TestCase(8, "nuance", "sad but energetic songs", [
+    TestCase(9, "nuance", "sad but energetic songs", [
         ("valence_max is negative or lower",
          lambda ti, p: (
              ti.get("valence_max") in ("negative", "very-negative", None) and
@@ -228,7 +229,7 @@ TEST_CASES = [
          check_energy_at_least("medium-high")),
     ]),
 
-    TestCase(9, "nuance", "happy but calm playlist", [
+    TestCase(10, "nuance", "happy but calm playlist", [
         ("valence_min positive or above",
          lambda ti, p: (
              ti.get("valence_min") in ("positive", "very-positive"),
@@ -237,38 +238,38 @@ TEST_CASES = [
         ("energy_max low or medium-low", check_energy_at_most("medium-low")),
     ]),
 
-    TestCase(10, "coverage", "songs for a rainy day", [
+    TestCase(12, "coverage", "songs for a rainy day", [
         ("tags include rainy-day concept or synonyms",
          check_tags_include_any(["rainy", "rain", "melancholic", "wistful", "reflective", "cozy"])),
         ("playlist returns at least 15 tracks", check_playlist_min_size(15)),
     ],
     manual_review="Do the tracks actually feel rainy-day appropriate?"),
 
-    TestCase(11, "coverage", "victory parade music", [
+    TestCase(13, "coverage", "victory parade music", [
         ("tags include triumphant/celebration concepts",
          check_tags_include_any(["triumphant", "celebration", "victory", "anthemic", "uplifting"])),
         ("energy_min at least medium-high", check_energy_at_least("medium-high")),
         ("playlist returns at least 15 tracks", check_playlist_min_size(15)),
     ]),
 
-    TestCase(12, "edge", "songs like SomeFakeTrackThatDoesntExist12345", [
+    TestCase(14, "edge", "songs like SomeFakeTrackThatDoesntExist12345", [
         ("no crash", check_no_crash()),
         ("playlist still produced (fallback path)", check_playlist_min_size(1)),
     ]),
 
-    TestCase(13, "edge", "playlist entirely new music like cardigan", [
+    TestCase(15, "edge", "playlist entirely new music like cardigan", [
         ("discover_new=true", check_param_equals("discover_new", True)),
         ("discovery_ratio=1.0 exactly", check_param_equals("discovery_ratio", 1.0)),
         ("100% new tracks", check_discovery_fraction(1.0, 1.0)),
     ]),
 
-    TestCase(14, "nuance", "calming yoga music but with lyrics, not instrumental", [
+    TestCase(16, "nuance", "calming yoga music but with lyrics, not instrumental", [
         ("require_lyrics is set to true",
          check_param_equals("require_lyrics", True)),
     ],
     manual_review="Do the returned tracks actually have vocals, not just avoid the word 'instrumental'?"),
 
-    TestCase(15, "exclusion", "upbeat pop playlist, not rock", [
+    TestCase(17, "exclusion", "upbeat pop playlist, not rock", [
         ("exclude_genres includes rock", check_param_includes("exclude_genres", "rock")),
     ]),
 ]
@@ -276,13 +277,63 @@ TEST_CASES = [
 
 # --- Runner ----------------------------------------------------------------
 
+def _call_agent_with_retry(prompt: str, search_tool, max_retries: int = 5,
+                           default_wait: float = 30.0):
+    """Call the agent, retrying on TRANSIENT errors (rate-limit 429 and
+    temporary overload 503).
+
+    This lives ONLY in the eval harness -- the eval fires many requests in a
+    burst and free-tier LLM providers (e.g. Gemini) rate-limit hard and also
+    return transient 503 "high demand" errors, so the eval needs to wait and
+    retry to complete. Live user queries deliberately do NOT retry (a user
+    shouldn't wait for a playlist) -- the provider layer stays fast-fail.
+
+    For 429s we honor the API's own suggested retry delay when present
+    ("retry in 51.1s"); for 503s (which carry no delay) we use exponential
+    backoff. Genuine (non-transient) errors are raised immediately -- no
+    point retrying a real failure."""
+    for attempt in range(max_retries):
+        try:
+            return call_agent(prompt, search_tool)
+        except Exception as e:
+            msg = str(e)
+            # Retry on TRANSIENT errors: rate limits (429/quota) AND
+            # temporary overload (503 UNAVAILABLE / "high demand"). Both are
+            # "try again later" conditions, not genuine failures.
+            is_rate_limit = (
+                "429" in msg or "RESOURCE_EXHAUSTED" in msg
+                or "rate limit" in msg.lower() or "quota" in msg.lower()
+            )
+            is_overloaded = (
+                "503" in msg or "UNAVAILABLE" in msg
+                or "high demand" in msg.lower() or "overloaded" in msg.lower()
+            )
+            is_transient = is_rate_limit or is_overloaded
+            if not is_transient or attempt == max_retries - 1:
+                raise
+
+            # 429s often carry a specific retry delay ("retry in 47.4s") --
+            # honor it. 503s don't, so use exponential backoff (5s, 10s, 20s,
+            # ...) capped, which spaces out attempts without over-waiting.
+            wait = None
+            m = re.search(r"retry in (\d+(?:\.\d+)?)s", msg) or re.search(r"retryDelay['\"]?:\s*['\"]?(\d+(?:\.\d+)?)s", msg)
+            if m:
+                wait = float(m.group(1)) + 1.0  # small buffer past the stated delay
+            if wait is None:
+                wait = min(default_wait, 5.0 * (2 ** attempt))  # 5,10,20,30(cap)...
+            reason = "rate-limited" if is_rate_limit else "model overloaded"
+            print(f"       ({reason}; waiting {wait:.0f}s then retrying, "
+                  f"attempt {attempt + 2}/{max_retries})")
+            time.sleep(wait)
+
+
 def run_single_case(
-    tc: TestCase, client: Anthropic, search_tool: dict, verbose: bool
+    tc: TestCase, search_tool: dict, verbose: bool
 ) -> dict:
     """Execute one test case end-to-end and return per-check results."""
     try:
-        params, debug_str, _, usage, discover_new, resolved_seed, discovery_ratio = call_agent(
-            client, tc.prompt, search_tool
+        params, debug_str, _, usage, discover_new, resolved_seed, discovery_ratio = _call_agent_with_retry(
+            tc.prompt, search_tool
         )
         tool_input = json.loads(debug_str)
 
@@ -466,12 +517,9 @@ def main():
     args = parser.parse_args()
 
     load_dotenv()
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise EnvironmentError("ANTHROPIC_API_KEY not found in .env")
 
-    print("Setting up eval run...")
-    client = Anthropic(api_key=api_key)
+    provider = os.getenv("LLM_PROVIDER", "anthropic")
+    print(f"Setting up eval run (LLM_PROVIDER={provider})...")
     vocabulary = get_tag_vocabulary()
     search_tool = build_search_tool(vocabulary)
 
@@ -483,7 +531,7 @@ def main():
     print(f"Running {len(cases)} case(s)...")
     results = []
     for tc in cases:
-        result = run_single_case(tc, client, search_tool, args.verbose)
+        result = run_single_case(tc, search_tool, args.verbose)
         results.append(result)
         print_result(result, args.verbose)
 

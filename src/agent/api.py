@@ -21,19 +21,28 @@ the API is browsable at http://127.0.0.1:8000/docs).
 
 import os
 import uuid
+import sys
 
 from pathlib import Path
+
+# spotify_auth.py / spotify_push.py may live in a sibling src/spotify/
+# folder (or alongside this file, in src/agent/). Add both candidate
+# locations to the import path so the imports below resolve regardless of
+# which layout is in use.
+_HERE = Path(__file__).parent
+for _candidate in (_HERE, _HERE.parent / "spotify"):
+    if _candidate.is_dir() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from anthropic import Anthropic
 
 from agent import generate_playlist, get_tag_vocabulary, build_search_tool
 from spotify_auth import get_valid_access_token
-from spotify_push import push_playlist, resolve_playlist
+from spotify_push import push_playlist, resolve_playlist, search_tracks_multi
 
 app = FastAPI(title="Mood Agent (local)")
 
@@ -45,10 +54,8 @@ _state: dict = {}
 
 def _startup():
     load_dotenv()
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise EnvironmentError("ANTHROPIC_API_KEY not found in .env")
-    _state["client"] = Anthropic(api_key=api_key)
+    # LLM keys are validated inside the provider layer (llm_provider) based on
+    # which LLM_PROVIDER is configured, so no Anthropic-specific check here.
     _state["vocabulary"] = get_tag_vocabulary()
     _state["search_tool"] = build_search_tool(_state["vocabulary"])
 
@@ -116,7 +123,7 @@ def query(req: QueryRequest):
 
     try:
         result = generate_playlist(
-            _state["client"], _state["search_tool"], req.prompt, req.context
+            _state["search_tool"], req.prompt, req.context
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
@@ -203,6 +210,53 @@ def push(req: PushRequest):
         added_count=result["added_count"],
         skipped=result["skipped"],
     )
+
+
+class SearchResult(BaseModel):
+    # Same fields the frontend already renders for a track, so an added
+    # track slots into the playlist list uniformly. id is assigned when
+    # the user actually adds it (client-side), so it's not here.
+    track_name: str
+    artist_name: str
+    track_uri: str
+    image_url: str | None = None
+    album: str = ""
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResult]
+
+
+@app.get("/search", response_model=SearchResponse)
+def search(q: str):
+    """Free-text Spotify track search for the 'add a track' editor feature.
+    Returns several matches for the user to pick from."""
+    if not q.strip():
+        return SearchResponse(results=[])
+
+    try:
+        access_token = get_valid_access_token()
+    except EnvironmentError as e:
+        raise HTTPException(status_code=400, detail=f"Spotify not configured: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Spotify authorization failed: {e}")
+
+    try:
+        matches = search_tracks_multi(access_token, q)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+
+    results = [
+        SearchResult(
+            track_name=m["spotify_name"],
+            artist_name=m["spotify_artist"],
+            track_uri=m["uri"],
+            image_url=m.get("image_url"),
+            album=m.get("album", ""),
+        )
+        for m in matches
+    ]
+    return SearchResponse(results=results)
 
 
 @app.get("/health")
