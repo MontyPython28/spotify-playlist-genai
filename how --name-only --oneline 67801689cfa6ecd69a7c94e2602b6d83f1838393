@@ -1,0 +1,17 @@
+[33mcommit 67801689cfa6ecd69a7c94e2602b6d83f1838393[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m)[m
+Author: Samyukta <samyusubs@gmail.com>
+Date:   Mon Sep 21 23:33:46 2026 +0800
+
+    Integrate free Grok LLM engine support
+
+[33mcommit d6421c71efaa0bc0655128bcb58c2ca903c47ba2[m
+Author: Samyukta <samyusubs@gmail.com>
+Date:   Sun Sep 20 18:51:02 2026 +0800
+
+    Add local web UI
+
+[33mcommit ff06c9d2b55e8160209781d3583d00fb96851b41[m[33m ([m[1;31morigin/master[m[33m)[m
+Author: Samyukta <samyusubs@gmail.com>
+Date:   Mon Aug 10 21:34:43 2026 +0800
+
+    Initial commit

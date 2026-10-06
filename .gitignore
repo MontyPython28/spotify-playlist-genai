@@ -30,3 +30,4 @@ frontend/node_modules/
 
 # evaluation outputs
 eval_results/
+static/

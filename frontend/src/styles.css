@@ -1,0 +1,92 @@
+:root {
+  --bg: #0b100d;
+  --surface: #131a16;
+  --surface-hover: #1a231e;
+  --line: rgba(245, 236, 220, 0.1);
+  --text: #f5ecdc;
+  --muted: #a39d8f;
+  --green: #4ad37a;
+  --amber: #f2a93a;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ---------- Vinyl ---------- */
+.vinyl {
+  position: relative;
+  width: 220px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  margin: 0 auto;
+  background:
+    radial-gradient(circle at 30% 25%, rgba(242, 169, 58, 0.35), transparent 45%),
+    radial-gradient(circle at 75% 80%, rgba(74, 211, 122, 0.25), transparent 50%),
+    repeating-radial-gradient(circle, #0d0d0d 0 2px, #1b1b1b 2px 3px),
+    #111;
+  box-shadow: 0 0 90px -10px rgba(242, 169, 58, 0.45), 0 0 0 1px var(--line);
+  animation: spin 16s linear infinite;
+}
+.vinyl.is-spinning { animation-duration: 1.6s; }
+.vinyl-label {
+  position: absolute;
+  inset: 33%;
+  border-radius: 50%;
+  background: var(--amber);
+  display: grid;
+  place-items: center;
+}
+.vinyl-label::after {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bg);
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- Prompt bar ---------- */
+.prompt-bar {
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  transition: border-color 150ms ease;
+}
+.prompt-bar:focus-within { border-color: var(--green); }
+
+.chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-family: "Fraunces", serif;
+  font-style: italic;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+.chip:hover { border-color: var(--amber); color: var(--amber); }
+
+/* ---------- Tracklist ---------- */
+.track {
+  display: grid;
+  grid-template-columns: 2rem 44px 1fr auto;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  border-left: 2px solid transparent;
+  transition: background 120ms ease;
+}
+.track:hover { background: var(--surface-hover); }
+.track.is-new { border-left-color: var(--amber); }
+.track-num {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  color: var(--amber);
+}

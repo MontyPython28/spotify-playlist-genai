@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@hello-pangea/dnd": "^18.0.1",
     "@mantine/core": "^9.6.1",
     "@mantine/hooks": "^9.6.1",
     "react": "^19.0.0",
