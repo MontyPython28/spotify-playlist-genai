@@ -71,6 +71,48 @@ def search_track(access_token: str, track_name: str, artist_name: str) -> str | 
     return items[0]["uri"]
 
 
+def _spotify_item_to_track(item: dict) -> dict:
+    """Convert one Spotify search-result item into the track dict shape the
+    frontend uses (uri + album art + canonical name/artist/album). Shared by
+    resolve_track (single best match) and search_tracks_multi (several
+    options to choose from)."""
+    album = item.get("album", {})
+    images = album.get("images", [])
+    # Spotify returns images largest-first (typically 640/300/64). Prefer a
+    # mid/small one for a list thumbnail rather than the full-size cover.
+    image_url = images[-1]["url"] if images else None
+    if len(images) >= 2:
+        image_url = images[1]["url"]  # the ~300px middle size when available
+    artists = item.get("artists", [])
+    return {
+        "uri": item["uri"],
+        "image_url": image_url,
+        "album": album.get("name", ""),
+        "spotify_name": item.get("name", ""),
+        "spotify_artist": artists[0]["name"] if artists else "",
+    }
+
+
+def search_tracks_multi(access_token: str, query: str, limit: int = 8) -> list[dict]:
+    """Free-text Spotify track search returning SEVERAL matches, for the
+    'add a track' feature (the user types a song and picks from results).
+    Unlike resolve_track (one best match, name+artist), this takes whatever
+    the user typed and returns a ranked list. Returns [] on no matches.
+
+    Note: Spotify's free/standard search caps limit at 10; we default to 8."""
+    query = query.strip()
+    if not query:
+        return []
+    resp = requests.get(
+        f"{API_BASE}/search",
+        headers=_auth_headers(access_token),
+        params={"q": query, "type": "track", "limit": min(limit, 10)},
+    )
+    _raise_with_detail(resp)
+    items = resp.json().get("tracks", {}).get("items", [])
+    return [_spotify_item_to_track(it) for it in items]
+
+
 def resolve_track(access_token: str, track_name: str, artist_name: str) -> dict | None:
     """Like search_track, but returns the fuller match info the UI needs --
     URI plus album artwork and the canonical name/artist Spotify has on
@@ -97,24 +139,12 @@ def resolve_track(access_token: str, track_name: str, artist_name: str) -> dict 
     items = resp.json().get("tracks", {}).get("items", [])
     if not items:
         return None
-
-    item = items[0]
-    album = item.get("album", {})
-    images = album.get("images", [])
-    # Spotify returns images largest-first (typically 640/300/64). Prefer a
-    # mid/small one for a list thumbnail rather than the full-size cover.
-    image_url = images[-1]["url"] if images else None
-    if len(images) >= 2:
-        image_url = images[1]["url"]  # the ~300px middle size when available
-
-    artists = item.get("artists", [])
-    return {
-        "uri": item["uri"],
-        "image_url": image_url,
-        "album": album.get("name", ""),
-        "spotify_name": item.get("name", track_name),
-        "spotify_artist": artists[0]["name"] if artists else artist_name,
-    }
+    result = _spotify_item_to_track(items[0])
+    # resolve_track historically falls back to the caller's name/artist when
+    # Spotify omits them; preserve that.
+    result["spotify_name"] = result["spotify_name"] or track_name
+    result["spotify_artist"] = result["spotify_artist"] or artist_name
+    return result
 
 
 def add_tracks_to_playlist(access_token: str, playlist_id: str, uris: list[str]) -> None:

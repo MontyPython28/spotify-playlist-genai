@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import {
   Container,
   Title,
@@ -28,7 +28,15 @@ export default function App() {
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [result, setResult] = useState(null); // { tracks, library_count, new_count, similar_note, cost_usd }
+  const [result, setResult] = useState(null); // raw API response
+  const [tracks, setTracks] = useState([]);    // editable working copy (remove/add)
+
+  // Add-a-track search state
+  const [addOpen, setAddOpen] = useState(false);
+  const [addQuery, setAddQuery] = useState("");
+  const [addResults, setAddResults] = useState([]);
+  const [addSearching, setAddSearching] = useState(false);
+  const searchTimer = useRef(null);
 
   // Push modal state
   const [pushOpened, { open: openPush, close: closePush }] = useDisclosure(false);
@@ -43,6 +51,10 @@ export default function App() {
     setLoading(true);
     setError(null);
     setResult(null);
+    setTracks([]);
+    setAddOpen(false);
+    setAddResults([]);
+    setAddQuery("");
     setPushResult(null);
     try {
       const resp = await fetch("/query", {
@@ -54,7 +66,9 @@ export default function App() {
         const detail = await resp.json().catch(() => ({}));
         throw new Error(detail.detail || `Request failed (${resp.status})`);
       }
-      setResult(await resp.json());
+      const data = await resp.json();
+      setResult(data);
+      setTracks(data.tracks);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -63,7 +77,7 @@ export default function App() {
   }
 
   async function pushToSpotify() {
-    if (!playlistName.trim() || !result) return;
+    if (!playlistName.trim() || tracks.length === 0) return;
     setPushing(true);
     setPushError(null);
     try {
@@ -71,7 +85,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          tracks: result.tracks,
+          tracks: tracks,
           name: playlistName,
           public: makePublic,
         }),
@@ -87,6 +101,47 @@ export default function App() {
     } finally {
       setPushing(false);
     }
+  }
+
+  function removeTrack(id) {
+    setTracks((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  async function searchToAdd(q) {
+    if (!q.trim()) {
+      setAddResults([]);
+      return;
+    }
+    setAddSearching(true);
+    try {
+      const resp = await fetch(`/search?q=${encodeURIComponent(q)}`);
+      if (!resp.ok) throw new Error("search failed");
+      const data = await resp.json();
+      setAddResults(data.results || []);
+    } catch {
+      setAddResults([]);
+    } finally {
+      setAddSearching(false);
+    }
+  }
+
+  function addTrack(r) {
+    // Shape a /search result into a track row; mark as "new" and give it a
+    // client-side id so it slots into the editable list uniformly.
+    const newTrack = {
+      id: `added-${r.track_uri}-${Date.now()}`,
+      track_name: r.track_name,
+      artist_name: r.artist_name,
+      track_uri: r.track_uri,
+      image_url: r.image_url,
+      album: r.album,
+      source: "new",
+      genre: "",
+    };
+    // Avoid duplicates (same uri already in the list).
+    setTracks((prev) =>
+      prev.some((t) => t.track_uri === r.track_uri) ? prev : [...prev, newTrack]
+    );
   }
 
   return (
@@ -188,14 +243,16 @@ export default function App() {
                     Tracklist
                   </Title>
                   <Text c="dimmed" size="sm" ff="monospace">
-                    {result.library_count} from library
-                    {result.new_count > 0 && ` · ${result.new_count} new`}
+                    {tracks.length} track{tracks.length === 1 ? "" : "s"}
+                    {tracks.filter((t) => t.source === "new").length > 0 &&
+                      ` · ${tracks.filter((t) => t.source === "new").length} new`}
                   </Text>
                 </div>
                 <Button
                   variant="outline"
                   color="amber"
                   radius="xl"
+                  disabled={tracks.length === 0}
                   onClick={() => {
                     setPlaylistName(prompt.slice(0, 40));
                     openPush();
@@ -212,10 +269,80 @@ export default function App() {
               )}
 
               <div>
-                {result.tracks.map((t, i) => (
-                  <TrackRow key={t.id} track={t} index={i} />
+                {tracks.map((t, i) => (
+                  <TrackRow key={t.id} track={t} index={i} onRemove={() => removeTrack(t.id)} />
                 ))}
               </div>
+
+              {/* Add a track -- search Spotify and append */}
+              {!addOpen ? (
+                <button className="add-track-btn" onClick={() => setAddOpen(true)}>
+                  <span className="add-plus">+</span> Add a track
+                </button>
+              ) : (
+                <div className="add-panel">
+                  <div className="prompt-bar" style={{ marginBottom: addResults.length ? 12 : 0 }}>
+                    <TextInput
+                      flex={1}
+                      variant="unstyled"
+                      px="md"
+                      placeholder="search Spotify for a song…"
+                      value={addQuery}
+                      autoFocus
+                      onChange={(e) => {
+                        const v = e.currentTarget.value;
+                        setAddQuery(v);
+                        // Debounce: only hit /search after typing pauses, so
+                        // we don't fire a Spotify request on every keystroke.
+                        clearTimeout(searchTimer.current);
+                        searchTimer.current = setTimeout(() => searchToAdd(v), 350);
+                      }}
+                    />
+                    <Button
+                      variant="subtle"
+                      color="gray"
+                      onClick={() => {
+                        setAddOpen(false);
+                        setAddQuery("");
+                        setAddResults([]);
+                      }}
+                    >
+                      Done
+                    </Button>
+                  </div>
+                  {addSearching && (
+                    <Text size="xs" c="dimmed" ff="monospace" px="md">
+                      searching…
+                    </Text>
+                  )}
+                  {addResults.map((r) => {
+                    const already = tracks.some((t) => t.track_uri === r.track_uri);
+                    return (
+                      <div className="add-result" key={r.track_uri}>
+                        <Image
+                          src={r.image_url}
+                          w={36}
+                          h={36}
+                          radius="sm"
+                          fallbackSrc="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36'%3E%3Crect width='36' height='36' fill='%231a231e'/%3E%3C/svg%3E"
+                        />
+                        <Box style={{ minWidth: 0, flex: 1 }}>
+                          <Text truncate size="sm">{r.track_name}</Text>
+                          <Text truncate size="xs" c="dimmed">{r.artist_name}</Text>
+                        </Box>
+                        <button
+                          className="row-btn add"
+                          disabled={already}
+                          title={already ? "Already in playlist" : "Add"}
+                          onClick={() => addTrack(r)}
+                        >
+                          {already ? "✓" : "+"}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </Stack>
           )}
         </Stack>
@@ -264,7 +391,7 @@ export default function App() {
 
 // One track row, styled like a record sleeve tracklist. New discoveries get
 // an amber left rule plus a small badge.
-function TrackRow({ track, index }) {
+function TrackRow({ track, index, onRemove }) {
   const isNew = track.source === "new";
 
   return (
@@ -297,6 +424,9 @@ function TrackRow({ track, index }) {
             new
           </Badge>
         )}
+        <button className="row-btn remove" title="Remove" onClick={onRemove}>
+          −
+        </button>
       </Group>
     </div>
   );
