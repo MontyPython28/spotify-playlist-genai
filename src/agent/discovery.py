@@ -1,7 +1,7 @@
 """
 discovery.py -- Phase 6b: find NEW music outside the user's library.
 
-Uses TWO Last.fm discovery surfaces, aggregated together:
+Uses Last.fm, Deezer and ListenBrainz discovery surfaces, aggregated together:
 1. track.getSimilar -- "tracks similar to this track"
 2. artist.getSimilar + artist.getTopTracks -- "artists similar to this
    artist" → their most popular tracks
@@ -20,9 +20,10 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from dotenv import load_dotenv
 
-from search_engine import DB_FILE, find_track
+from search_engine import DB_FILE
+from extra_sources import deezer_related_top_tracks, listenbrainz_similar_artist_tracks
 
-LASTFM_BASE_URL = "http://ws.audioscrobbler.com/2.0/"
+LASTFM_BASE_URL = "https://ws.audioscrobbler.com/2.0/"
 
 _session = requests.Session()
 
@@ -116,8 +117,8 @@ def discover_new_music(
     """
     load_dotenv()
     api_key = os.getenv("LASTFM_API_KEY")
-    if not api_key:
-        raise EnvironmentError("LASTFM_API_KEY not found in .env")
+    if not seeds or limit <= 0:
+        return []
 
     candidates: dict[tuple[str, str], dict] = {}
 
@@ -142,22 +143,40 @@ def discover_new_music(
     # similar-artist lists produced in phase 1.
     unique_seed_artists = list({a.strip().lower(): (t, a) for t, a in seeds}.values())
 
+    def _safe_result(future):
+        try:
+            result = future.result()
+            return result if isinstance(result, list) else []
+        except Exception:
+            return []
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         # Phase 1: per-seed similar tracks + per-unique-artist similar artists
         similar_tracks_futures = [
-            executor.submit(get_similar_tracks, api_key, a, t) for t, a in seeds
+            executor.submit(get_similar_tracks, api_key, a, t) for t, a in seeds if api_key
         ]
         similar_artists_futures = {
             a: executor.submit(get_similar_artists, api_key, a)
-            for _, a in unique_seed_artists
+            for _, a in unique_seed_artists if api_key
         }
 
+        # Extra free sources: Deezer related artists + ListenBrainz
+        # "also played" sessions. Each fails soft (returns []).
+        deezer_futures = [
+            executor.submit(deezer_related_top_tracks, a) for _, a in unique_seed_artists[:5]
+        ]
+        lb_futures = [
+            executor.submit(listenbrainz_similar_artist_tracks, a) for _, a in unique_seed_artists[:5]
+        ]
+
         for fut in similar_tracks_futures:
-            _merge(fut.result())
+            _merge(_safe_result(fut))
+        for fut in deezer_futures + lb_futures:
+            _merge(_safe_result(fut))
 
         similar_artist_names = []
         for fut in similar_artists_futures.values():
-            similar_artist_names.extend(fut.result())
+            similar_artist_names.extend(_safe_result(fut))
         # Dedupe similar artists so we don't fetch the same one's top tracks twice
         similar_artist_names = list(dict.fromkeys(similar_artist_names))
 
@@ -166,7 +185,7 @@ def discover_new_music(
             executor.submit(get_artist_top_tracks, api_key, a) for a in similar_artist_names
         ]
         for fut in top_track_futures:
-            _merge(fut.result())
+            _merge(_safe_result(fut))
 
     # Filter out anything already in the user's library (single batched
     # read + in-memory set membership, instead of a DB query per candidate).
